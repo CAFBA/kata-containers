@@ -4,13 +4,16 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-set -o errexit
-set -o pipefail
-set -o nounset
+set -o errexit  # 任何命令失败立即退出
+set -o pipefail # 管道命令中任意阶段失败视为整体失败
+set -o nounset  # 使用未定义变量时报错
 
+# CRI-O配置文件路径
 crio_drop_in_conf_dir="/etc/crio/crio.conf.d/"
 crio_drop_in_conf_file="${crio_drop_in_conf_dir}/99-kata-deploy"
 crio_drop_in_conf_file_debug="${crio_drop_in_conf_dir}/100-debug"
+
+# containerd配置文件路径
 containerd_conf_file="/etc/containerd/config.toml"
 containerd_conf_file_backup="${containerd_conf_file}.bak"
 containerd_conf_tmpl_file=""
@@ -35,14 +38,17 @@ info() {
 
 DEBUG="${DEBUG:-"false"}"
 
+# SHIMS
 SHIMS="${SHIMS:-"clh cloud-hypervisor dragonball fc qemu qemu-coco-dev qemu-runtime-rs qemu-se-runtime-rs qemu-snp qemu-tdx stratovirt qemu-nvidia-gpu qemu-nvidia-gpu-snp qemu-nvidia-gpu-tdx"}"
 IFS=' ' read -a shims <<< "$SHIMS"
 DEFAULT_SHIM="${DEFAULT_SHIM:-"qemu"}"
 default_shim="$DEFAULT_SHIM"
 
+# 默认值是 true 
 CREATE_RUNTIMECLASSES="${CREATE_RUNTIMECLASSES:-"false"}"
 CREATE_DEFAULT_RUNTIMECLASS="${CREATE_DEFAULT_RUNTIMECLASS:-"false"}"
 
+# ALLOWED_HYPERVISOR_ANNOTATIONS
 ALLOWED_HYPERVISOR_ANNOTATIONS="${ALLOWED_HYPERVISOR_ANNOTATIONS:-}"
 
 IFS=' ' read -a non_formatted_allowed_hypervisor_annotations <<< "$ALLOWED_HYPERVISOR_ANNOTATIONS"
@@ -50,18 +56,23 @@ allowed_hypervisor_annotations=""
 for allowed_hypervisor_annotation in "${non_formatted_allowed_hypervisor_annotations[@]}"; do
 	allowed_hypervisor_annotations+="\"$allowed_hypervisor_annotation\", "
 done
+# 移除末尾逗号
 allowed_hypervisor_annotations=$(echo $allowed_hypervisor_annotations | sed 's/,$//')
 
+# SNAPSHOTTER_HANDLER_MAPPING
 SNAPSHOTTER_HANDLER_MAPPING="${SNAPSHOTTER_HANDLER_MAPPING:-}"
 IFS=',' read -a snapshotters <<< "$SNAPSHOTTER_HANDLER_MAPPING"
 snapshotters_delimiter=':'
 
+# AGENT
 AGENT_HTTPS_PROXY="${AGENT_HTTPS_PROXY:-}"
 AGENT_NO_PROXY="${AGENT_NO_PROXY:-}"
 
+# PULL_TYPE_MAPPING
 PULL_TYPE_MAPPING="${PULL_TYPE_MAPPING:-}"
 IFS=',' read -a pull_types <<< "$PULL_TYPE_MAPPING"
 
+# 安装路径
 INSTALLATION_PREFIX="${INSTALLATION_PREFIX:-}"
 default_dest_dir="/opt/kata"
 dest_dir="${default_dest_dir}"
@@ -74,6 +85,7 @@ if [ -n "${INSTALLATION_PREFIX}" ]; then
 	dest_dir="${INSTALLATION_PREFIX}${default_dest_dir}"
 fi
 
+# 添加后缀以区分多个安装环境的路径，支持同一类型 shim 的多实例/多版本共存
 MULTI_INSTALL_SUFFIX="${MULTI_INSTALL_SUFFIX:-}"
 if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
 	dest_dir="${dest_dir}-${MULTI_INSTALL_SUFFIX}"
@@ -87,7 +99,9 @@ host_install_dir="/host${dest_dir}"
 
 HELM_POST_DELETE_HOOK="${HELM_POST_DELETE_HOOK:-"false"}"
 
+# 在宿主机命名空间中执行systemctl命令
 function host_systemctl() {
+  	# 进入 PID 为 1 的进程的命名空间，进入宿主机的 Mount Namespace
 	nsenter --target 1 --mount systemctl "${@}"
 }
 
@@ -99,16 +113,21 @@ function print_usage() {
 	echo "Usage: $0 [install/cleanup/reset]"
 }
 
+# 创建Kubernetes RuntimeClass资源
 function create_runtimeclasses() {
 	echo "Creating the runtime classes"
 
+	# 为每个shim类型创建对应的RuntimeClass
 	for shim in "${shims[@]}"; do
 		echo "Creating the kata-${shim} runtime class"
+		# 处理多实例安装情况下的名称调整
 		if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
+		  # 替换 YAML 文件中的字符串 kata-${shim} 为 kata-${shim}-${MULTI_INSTALL_SUFFIX}
 			sed -i -e "s|kata-${shim}|kata-${shim}-${MULTI_INSTALL_SUFFIX}|g" /opt/kata-artifacts/runtimeclasses/kata-${shim}.yaml
 		fi
 		kubectl apply -f /opt/kata-artifacts/runtimeclasses/kata-${shim}.yaml
 
+    	# 恢复 YAML 文件原始内容
 		if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
 			# Move the file back to its original state, as the deletion is done
 			# differently in the helm and in the kata-deploy daemonset case, meaning
@@ -119,7 +138,9 @@ function create_runtimeclasses() {
 
 	done
 
+  	# 可选功能：创建默认 RuntimeClass
 	if [[ "${CREATE_DEFAULT_RUNTIMECLASS}" == "true" ]]; then
+		# 多实例安装不支持创建默认RuntimeClass
 		if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
 			warn "CREATE_DEFAULT_RUNTIMECLASS is being ignored!"
 			warn "multi installation does not support creating a default runtime class"
@@ -127,6 +148,7 @@ function create_runtimeclasses() {
 			return
 		fi
 
+		# 创建默认RuntimeClass(作为默认shim的别名)
 		echo "Creating the kata runtime class for the default shim (an alias for kata-${default_shim})"
 		cp /opt/kata-artifacts/runtimeclasses/kata-${default_shim}.yaml /tmp/kata.yaml
 		sed -i -e 's/name: kata-'${default_shim}'/name: kata/g' /tmp/kata.yaml
@@ -138,8 +160,10 @@ function create_runtimeclasses() {
 function delete_runtimeclasses() {
 	echo "Deleting the runtime classes"
 
+	# 删除每个shim对应的RuntimeClass
 	for shim in "${shims[@]}"; do
 		echo "Deleting the kata-${shim} runtime class"
+		# 处理多实例安装情况
 		canonical_shim_name="kata-${shim}"
 		shim_name="${canonical_shim_name}"
 		if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
@@ -149,7 +173,9 @@ function delete_runtimeclasses() {
 		kubectl delete --ignore-not-found -f /opt/kata-artifacts/runtimeclasses/${canonical_shim_name}.yaml
 	done
 
-
+	# 创建的时候因为 helm 和 kata-deploy daemonset 的删除逻辑不同所以需要恢复原来内容以支持删除，而创建和删除只会进行一次，删除后不需要再恢复
+	
+	# 删除默认RuntimeClass
 	if [[ "${CREATE_DEFAULT_RUNTIMECLASS}" == "true" ]]; then
 		if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
 			# There's nothing to be done here, as a default runtime class is never created
@@ -165,18 +191,22 @@ function delete_runtimeclasses() {
 	fi
 }
 
+# 检测节点使用的容器运行时
 function get_container_runtime() {
-
+	# 通过kubectl获取节点信息
 	local runtime=$(kubectl get node $NODE_NAME -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}')
 	local microk8s=$(kubectl get node $NODE_NAME -o jsonpath='{.metadata.labels.microk8s\.io\/cluster}')
+	#  kubectl get node 命令失败，则调用 die 函数
 	if [ "$?" -ne 0 ]; then
-                die "invalid node name"
+    die "invalid node name"
 	fi
 
+  	# 根据节点的 status.nodeInfo.containerRuntimeVersion 字段判断运行时
 	if echo "$runtime" | grep -qE "cri-o"; then
 		echo "cri-o"
 	elif [ "$microk8s" == "true" ]; then
 		echo "microk8s"
+	# 如果 containerRuntimeVersion 中包含 containerd 并且还包含 -k3s（比如 containerd://1.6.0-k3s1），则说明可能运行在 K3s 或 RKE2 环境中
 	elif echo "$runtime" | grep -qE 'containerd.*-k3s'; then
 		if host_systemctl is-active --quiet rke2-agent; then
 			echo "rke2-agent"
@@ -189,10 +219,12 @@ function get_container_runtime() {
 		fi
 	# Note: we assumed you used a conventional k0s setup and k0s will generate a systemd entry k0scontroller.service and k0sworker.service respectively
 	# and it is impossible to run this script without a kubelet, so this k0s controller must also have worker mode enabled
+	# 判断是否为 k0s
 	elif host_systemctl is-active --quiet k0scontroller; then
 		echo "k0s-controller"
 	elif host_systemctl is-active --quiet k0sworker; then
 		echo "k0s-worker"
+	# 提取 containerRuntimeVersion 的第一个字段
 	else
 		echo "$runtime" | awk -F '[:]' '{print $1}'
 	fi
@@ -235,6 +267,7 @@ function is_containerd_capable_of_using_drop_in_files() {
 	echo "true"
 }
 
+# 获取Kata配置路径(根据shim类型区分golang/rust运行时)
 function get_kata_containers_config_path() {
 	local shim="$1"
 
@@ -271,6 +304,7 @@ function get_kata_containers_config_path() {
 	echo "$config_path"
 }
 
+# 获取Kata运行时路径(根据shim类型区分golang/rust运行时)
 function get_kata_containers_runtime_path() {
 	local shim="$1"
 
@@ -385,9 +419,13 @@ EOF
 	sed -i -e "s|${qemu_binary}|${qemu_binary_script}|" ${config_path}
 }
 
+# 安装Kata组件到宿主机
+# 将 /opt/kata-artifacts/opt/kata/ 下有关 kata 运行时的所有文件复制到 /host/opt/kata
+# 主机的 / 会挂载到容器内的 /host/，因此在主机上也有一份 /opt/kata 运行时的所有文件
 function install_artifacts() {
 	echo "copying kata artifacts onto host"
 
+  	# /host/opt/kata
 	mkdir -p ${host_install_dir}
 	cp -au /opt/kata-artifacts/opt/kata/* ${host_install_dir}/
 	chmod +x ${host_install_dir}/bin/*
@@ -396,6 +434,7 @@ function install_artifacts() {
 
 	local config_path
 
+  	# 读取每一个 shim 相应的 kata 配置文件
 	for shim in "${shims[@]}"; do
 		config_path="/host/$(get_kata_containers_config_path "${shim}")"
 		mkdir -p "$config_path"
@@ -481,7 +520,6 @@ function install_artifacts() {
 		sed -i -E "s|(valid_hypervisor_paths) = .+|\1 = [\"${clh_path}\"]|" "${config_path}"
 		sed -i -E "s|(path) = \".+/cloud-hypervisor\"|\1 = \"${clh_path}\"|" "${config_path}"
 	fi
-
 
 	if [[ "${CREATE_RUNTIMECLASSES}" == "true" ]]; then
 		create_runtimeclasses
@@ -602,6 +640,7 @@ EOF
 
 function configure_containerd_runtime() {
 	local shim="$2"
+	# 如果设置环境变量 MULTI_INSTALL_SUFFIX，则也要添加相应的配置，支持同一类型 shim 的多实例/多版本共存
 	local adjusted_shim_to_multi_install="${shim}"
 	if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
 		adjusted_shim_to_multi_install="${shim}-${MULTI_INSTALL_SUFFIX}"
@@ -616,11 +655,13 @@ function configure_containerd_runtime() {
 		configuration_file="/host${containerd_drop_in_conf_file}"
 	fi
 
+	# 如果是 k0s-worker或 k0s-controller节点，使用 /etc/containerd/containerd.toml 作为主配置文件
 	local containerd_root_conf_file="$containerd_conf_file"
 	if [[ "$1" =~ ^(k0s-worker|k0s-controller)$ ]]; then
 		containerd_root_conf_file="/etc/containerd/containerd.toml"
 	fi
 
+	# 决定后续在 TOML 中要修改的 plugin 表路径，因为不同版本的 containerd，其内部插件结构可能不同
 	if grep -q "version = 2\>" $containerd_root_conf_file; then
 		pluginid=\"io.containerd.grpc.v1.cri\"
 	fi
@@ -629,22 +670,46 @@ function configure_containerd_runtime() {
 		pluginid=\"io.containerd.cri.v1.runtime\"
 	fi
 
+	# 构造 TOML 配置路径
+
+	# 在 containerd 的 TOML 配置中，要修改的运行时配置区块路径
 	local runtime_table=".plugins.${pluginid}.containerd.runtimes.\"${runtime}\""
+	# 运行时配置中的 options 子表
 	local runtime_options_table="${runtime_table}.options"
+	# 运行时实现类型
 	local runtime_type=\"io.containerd."${runtime}".v2\"
+	# 运行时加载的配置文件路径
 	local runtime_config_path=\"$(get_kata_containers_config_path "${shim}")/${configuration}.toml\"
+	# 运行时对应的实际 hypervisor 可执行文件路径
 	local runtime_path=\"$(get_kata_containers_runtime_path "${shim}")\"
 
+	# 使用 tomlq 动态修改 containerd 的 TOML 配置
 	tomlq -i -t $(printf '%s.runtime_type=%s' ${runtime_table} ${runtime_type}) ${configuration_file}
 	tomlq -i -t $(printf '%s.runtime_path=%s' ${runtime_table} ${runtime_path}) ${configuration_file}
 	tomlq -i -t $(printf '%s.privileged_without_host_devices=true' ${runtime_table}) ${configuration_file}
+	#
 	tomlq -i -t $(printf '%s.pod_annotations=["io.katacontainers.*"]' ${runtime_table}) ${configuration_file}
 	tomlq -i -t $(printf '%s.ConfigPath=%s' ${runtime_options_table} ${runtime_config_path}) ${configuration_file}
+
+	# 修改后添加到内容如下
+
+	  # [plugins]
+  	# 	[plugins."io.containerd.grpc.v1.cri"] Plugin table
+    # 	  [plugins."io.containerd.grpc.v1.cri".containerd]
+    #       [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+	  # 上述是已有的结构，下述是添加的结构，runtimes.kata 的 kata 就是 runtimeclass 中 handler 字段指定的值
+	  # 		  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+    # 			  runtime_type = "io.containerd.kata.v2"
+    # 			  privileged_without_host_devices = true
+    # 			  pod_annotations = ["io.katacontainers.*"]
+    # 			  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]
+    # 				  ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration.toml"
 
 	if [ "${DEBUG}" == "true" ]; then
 		tomlq -i -t '.debug.level = "debug"' ${configuration_file}
 	fi
 
+	# 找到与当前 shim 对应的 snapshotter，并设置到运行时配置中的 snapshotter 字段让运行时使用指定的 SNAPSHOTTER_HANDLER
 	if [ -n "${SNAPSHOTTER_HANDLER_MAPPING}" ]; then
 		for m in "${snapshotters[@]}"; do
 			key="${m%$snapshotters_delimiter*}"
@@ -660,6 +725,7 @@ function configure_containerd_runtime() {
 	fi
 }
 
+# 先备份已有的，再创建配置文件
 function configure_containerd() {
 	# Configure containerd to use Kata:
 	echo "Add Kata Containers as a supported runtime for containerd"
@@ -676,6 +742,7 @@ function configure_containerd() {
 		tomlq -i -t $(printf '.imports|=.+["%s"]' ${containerd_drop_in_conf_file}) ${containerd_conf_file}
 	fi
 
+	# 为每一个 shim 添加配置
 	for shim in "${shims[@]}"; do
 		configure_containerd_runtime "$1" $shim
 	done
@@ -829,8 +896,10 @@ function main() {
 	   die  "This script must be run as root"
 	fi
 
+	# 检测当前容器运行时
 	runtime=$(get_container_runtime)
 
+	# 如果是 k8s，containerd_conf_file 使用默认值，否则修改为特定的 containerd 配置路径
 	# CRI-O isn't consistent with the naming -- let's use crio to match the service file
 	if [ "$runtime" == "cri-o" ]; then
 		runtime="crio"
@@ -850,7 +919,6 @@ function main() {
 		fi
 		containerd_conf_file_backup="${containerd_conf_tmpl_file}.bak"
 	fi
-
 
 	# only install / remove / update if we are dealing with CRIO or containerd
 	if [[ "$runtime" =~ ^(crio|containerd|k3s|k3s-agent|rke2-agent|rke2-server|k0s-worker|k0s-controller|microk8s)$ ]]; then
@@ -895,6 +963,7 @@ function main() {
 
 			install_artifacts
 			configure_cri_runtime "$runtime"
+			# 为 runtimeclass 添加用于调度的标签
 			kubectl label node "$NODE_NAME" --overwrite katacontainers.io/kata-runtime=true
 			;;
 		cleanup)
